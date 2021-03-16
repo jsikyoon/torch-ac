@@ -8,7 +8,8 @@ class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
     def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward):
+                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
+                 mem_type, mem_len, n_layer):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -41,6 +42,12 @@ class BaseAlgo(ABC):
         reshape_reward : function
             a function that shapes the reward, takes an
             (observation, action, reward, done) tuple as an input
+        mem_type : string
+            the memory type like LSTM or TrXL
+        mem_len: int
+            the length of memory
+        n_layer : int
+            layers of memory module
         """
 
         # Store parameters
@@ -58,6 +65,9 @@ class BaseAlgo(ABC):
         self.recurrence = recurrence
         self.preprocess_obss = preprocess_obss or default_preprocess_obss
         self.reshape_reward = reshape_reward
+        self.mem_type = mem_type
+        self.mem_len = mem_len
+        self.n_layer = n_layer
 
         # Control parameters
 
@@ -81,8 +91,12 @@ class BaseAlgo(ABC):
         self.obs = self.env.reset()
         self.obss = [None]*(shape[0])
         if self.acmodel.recurrent:
-            self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
-            self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
+            if self.mem_type == 'lstm':
+                self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
+                self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
+            else:  # transformers
+                self.memory = torch.zeros(shape[1], self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
+                self.memories = torch.zeros(*shape, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
@@ -129,7 +143,13 @@ class BaseAlgo(ABC):
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
                 if self.acmodel.recurrent:
-                    dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    if self.mem_type == 'lstm':
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    elif 'trxl' in self.mem_type:  # transformers
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory.permute(1,2,0,3))
+                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                    else:
+                        raise ValueError(f"The type must be one of lstm or trxls.")
                 else:
                     dist, value = self.acmodel(preprocessed_obs)
             action = dist.sample()
@@ -178,7 +198,10 @@ class BaseAlgo(ABC):
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.acmodel.recurrent:
-                _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                if self.mem_type =='lstm':
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                else:  # transformers
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory.permute(1,2,0,3))
             else:
                 _, next_value = self.acmodel(preprocessed_obs)
 
@@ -202,6 +225,7 @@ class BaseAlgo(ABC):
         exps.obs = [self.obss[i][j]
                     for j in range(self.num_procs)
                     for i in range(self.num_frames_per_proc)]
+
         if self.acmodel.recurrent:
             # T x P x D -> P x T x D -> (P * T) x D
             exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])

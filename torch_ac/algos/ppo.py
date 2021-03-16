@@ -11,15 +11,17 @@ class PPOAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None):
+                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                         value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward)
+                         value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
+                         mem_type, mem_len, n_layer)
 
         self.clip_eps = clip_eps
         self.epochs = epochs
         self.batch_size = batch_size
+        self.mem_type = mem_type
 
         assert self.batch_size % self.recurrence == 0
 
@@ -60,7 +62,10 @@ class PPOAlgo(BaseAlgo):
                     # Compute loss
 
                     if self.acmodel.recurrent:
-                        dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                        if self.mem_type == 'lstm':
+                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                        else: # transformers
+                            dist, value, memory = self.acmodel(sb.obs, memory.permute(1,2,0,3))
                     else:
                         dist, value = self.acmodel(sb.obs)
 
