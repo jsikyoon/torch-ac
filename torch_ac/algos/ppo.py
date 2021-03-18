@@ -65,7 +65,7 @@ class PPOAlgo(BaseAlgo):
                         if self.mem_type == 'lstm':
                             dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
                         else: # transformers
-                            dist, value, memory = self.acmodel(sb.obs, memory.permute(1,2,0,3))
+                            dist, value, memory = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3))
                     else:
                         dist, value = self.acmodel(sb.obs)
 

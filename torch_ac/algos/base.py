@@ -146,7 +146,8 @@ class BaseAlgo(ABC):
                     if self.mem_type == 'lstm':
                         dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                     elif 'trxl' in self.mem_type:  # transformers
-                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory.permute(1,2,0,3))
+                        dist, value, memory = self.acmodel(preprocessed_obs,
+                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
                         memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                     else:
                         raise ValueError(f"The type must be one of lstm or trxls.")
@@ -201,7 +202,8 @@ class BaseAlgo(ABC):
                 if self.mem_type =='lstm':
                     _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:  # transformers
-                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory.permute(1,2,0,3))
+                    _, next_value, _ = self.acmodel(preprocessed_obs,
+                            (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
             else:
                 _, next_value = self.acmodel(preprocessed_obs)
 
@@ -229,8 +231,12 @@ class BaseAlgo(ABC):
         if self.acmodel.recurrent:
             # T x P x D -> P x T x D -> (P * T) x D
             exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
-            # T x P -> P x T -> (P * T) x 1
-            exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
+            if self.mem_type == 'lstm':
+                # T x P -> P x T -> (P * T) x 1
+                exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
+            elif 'trxl' in self.mem_type:
+                # T x P -> P x T -> (P * T) x 1 x 1 x 1
+                exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         # for all tensors below, T x P -> P x T -> P * T
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1)
