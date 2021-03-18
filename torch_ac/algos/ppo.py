@@ -94,6 +94,8 @@ class PPOAlgo(BaseAlgo):
                     # Update memories for next epoch
 
                     if self.acmodel.recurrent and i < self.recurrence - 1:
+                        if 'trxl' in self.mem_type:
+                            memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                         exps.memory[inds + i + 1] = memory.detach()
 
                 # Update batch values
