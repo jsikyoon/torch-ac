@@ -85,14 +85,14 @@ class PPOAlgo(BaseAlgo):
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
                             dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, memory * sb.mask,
-                                    action * sb.mask[0],
+                                    action * sb.mask[:,0],
                                     state * sb.mask,
                                     sb.reward,
                                     get_rep_loss=True,
                                     get_img_loss=True)
                         else: # transformers
                             dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
-                                    action * sb.mask[:,:,0,0],
+                                    action * sb.mask[:,0,0,0],
                                     state * sb.mask[:,:,0,0],
                                     sb.reward,
                                     get_rep_loss=True,
@@ -123,7 +123,7 @@ class PPOAlgo(BaseAlgo):
                     batch_value += value.mean().item()
                     batch_policy_loss += policy_loss.item()
                     batch_value_loss += value_loss.item()
-                    if self.loss_type in ['all', 'rep-ppo']:
+                    if self.loss_type in ['all', 'rep-agent']:
                         batch_loss += loss
 
                     # Update representation losses
