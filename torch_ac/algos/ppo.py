@@ -11,7 +11,7 @@ class PPOAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5):
+                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5, loss_type='all'):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
@@ -22,6 +22,7 @@ class PPOAlgo(BaseAlgo):
         self.epochs = epochs
         self.batch_size = batch_size
         self.mem_type = mem_type
+        self.loss_type = loss_type
 
         assert self.batch_size % self.recurrence == 0
 
@@ -40,6 +41,15 @@ class PPOAlgo(BaseAlgo):
             log_value_losses = []
             log_grad_norms = []
 
+            log_rep_losses = []
+            log_recon_losses = []
+            log_reward_losses = []
+            log_kl_losses = []
+
+            log_img_losses = []
+            log_img_policy_losses = []
+            log_img_value_losses = []
+
             for inds in self._get_batches_starting_indexes():
                 # Initialize batch values
 
@@ -49,10 +59,21 @@ class PPOAlgo(BaseAlgo):
                 batch_value_loss = 0
                 batch_loss = 0
 
+                batch_rep_loss = 0
+                batch_recon_loss = 0
+                batch_reward_loss = 0
+                batch_kl_loss = 0
+
+                batch_img_loss = 0
+                batch_img_policy_loss = 0
+                batch_img_value_loss = 0
+
                 # Initialize memory
 
                 if self.acmodel.recurrent:
                     memory = exps.memory[inds]
+                    action = exps.prev_action[inds]
+                    state = exps.prev_state[inds]
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
@@ -63,11 +84,24 @@ class PPOAlgo(BaseAlgo):
 
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
-                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                            dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, memory * sb.mask,
+                                    action * sb.mask[0],
+                                    state * sb.mask,
+                                    sb.reward,
+                                    get_rep_loss=True,
+                                    get_img_loss=True)
                         else: # transformers
-                            dist, value, memory = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3))
+                            dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
+                                    action * sb.mask[:,:,0,0],
+                                    state * sb.mask[:,:,0,0],
+                                    sb.reward,
+                                    get_rep_loss=True,
+                                    get_img_loss=True)
                     else:
-                        dist, value = self.acmodel(sb.obs)
+                        #dist, value = self.acmodel(sb.obs)
+                        raise ValueError("Dreamer is memory-based model.")
+
+                    action = dist.sample()
 
                     entropy = dist.entropy().mean()
 
@@ -89,7 +123,24 @@ class PPOAlgo(BaseAlgo):
                     batch_value += value.mean().item()
                     batch_policy_loss += policy_loss.item()
                     batch_value_loss += value_loss.item()
-                    batch_loss += loss
+                    if self.loss_type in ['all', 'rep-ppo']:
+                        batch_loss += loss
+
+                    # Update representation losses
+
+                    batch_rep_loss += rep_loss['rep_loss'].item()
+                    batch_recon_loss += rep_loss['recon_loss'].item()
+                    batch_reward_loss += rep_loss['reward_loss'].item()
+                    batch_kl_loss += rep_loss['kl_loss'].item()
+                    batch_loss += rep_loss['rep_loss']
+
+                    # Update imaginary losses
+
+                    batch_img_loss += img_loss['img_loss'].item()
+                    batch_img_policy_loss += img_loss['policy_loss'].item()
+                    batch_img_value_loss += img_loss['value_loss'].item()
+                    if self.loss_type in ['all', 'rep-img']:
+                        batch_loss += img_loss['img_loss']
 
                     # Update memories for next epoch
 
@@ -97,6 +148,8 @@ class PPOAlgo(BaseAlgo):
                         if 'trxl' in self.mem_type:
                             memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                         exps.memory[inds + i + 1] = memory.detach()
+                        exps.prev_action[inds + i + 1] = action.detach()
+                        exps.prev_state[inds + i + 1] = state.detach()
 
                 # Update batch values
 
@@ -105,6 +158,15 @@ class PPOAlgo(BaseAlgo):
                 batch_policy_loss /= self.recurrence
                 batch_value_loss /= self.recurrence
                 batch_loss /= self.recurrence
+
+                batch_rep_loss /= self.recurrence
+                batch_recon_loss /= self.recurrence
+                batch_reward_loss /= self.recurrence
+                batch_kl_loss /= self.recurrence
+
+                batch_img_loss /= self.recurrence
+                batch_img_policy_loss /= self.recurrence
+                batch_img_value_loss /= self.recurrence
 
                 # Update actor-critic
 
@@ -122,6 +184,15 @@ class PPOAlgo(BaseAlgo):
                 log_value_losses.append(batch_value_loss)
                 log_grad_norms.append(grad_norm)
 
+                log_rep_losses.append(batch_rep_loss)
+                log_recon_losses.append(batch_recon_loss)
+                log_reward_losses.append(batch_reward_loss)
+                log_kl_losses.append(batch_kl_loss)
+
+                log_img_losses.append(batch_img_loss)
+                log_img_policy_losses.append(batch_img_policy_loss)
+                log_img_value_losses.append(batch_img_value_loss)
+
         # Log some values
 
         logs = {
@@ -129,7 +200,16 @@ class PPOAlgo(BaseAlgo):
             "value": numpy.mean(log_values),
             "policy_loss": numpy.mean(log_policy_losses),
             "value_loss": numpy.mean(log_value_losses),
-            "grad_norm": numpy.mean(log_grad_norms)
+            "grad_norm": numpy.mean(log_grad_norms),
+
+            "rep_loss": numpy.mean(log_rep_losses),
+            "recon_loss": numpy.mean(log_recon_losses),
+            "reward_loss": numpy.mean(log_reward_losses),
+            "kl_loss": numpy.mean(log_kl_losses),
+
+            "img_loss": numpy.mean(log_img_losses),
+            "img_policy_loss": numpy.mean(log_img_policy_losses),
+            "img_value_loss": numpy.mean(log_img_value_losses),
         }
 
         return logs

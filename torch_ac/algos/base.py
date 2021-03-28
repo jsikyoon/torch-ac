@@ -104,6 +104,11 @@ class BaseAlgo(ABC):
         self.rewards = torch.zeros(*shape, device=self.device)
         self.advantages = torch.zeros(*shape, device=self.device)
         self.log_probs = torch.zeros(*shape, device=self.device)
+        # states
+        self.states = torch.zeros(*shape, self.acmodel.semi_memory_size, device=self.device)
+        # previous actions and states
+        self.prev_actions = torch.zeros(*shape, device=self.device, dtype=torch.int64)
+        self.prev_states = torch.zeros(*shape, self.acmodel.semi_memory_size, device=self.device)
 
         # Initialize log values
 
@@ -140,19 +145,33 @@ class BaseAlgo(ABC):
         for i in range(self.num_frames_per_proc):
             # Do one agent-environment interaction
 
+            # previous action and state
+            if i == 0:
+                prev_action = torch.zeros(self.mask.shape[0], device=self.device, dtype=torch.int64)
+                prev_state = torch.zeros((self.mask.shape[0], self.acmodel.semi_memory_size), device=self.device)
+            else:
+                prev_action = action
+                prev_state = state
+
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
                 if self.acmodel.recurrent:
                     if self.mem_type == 'lstm':
-                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                        dist, value, memory, state, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                                prev_action * self.mask,
+                                prev_state * self.mask.unsqueeze(1))
                     elif 'trxl' in self.mem_type:  # transformers
-                        dist, value, memory = self.acmodel(preprocessed_obs,
-                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
+                        dist, value, memory, state, _, _ = self.acmodel(preprocessed_obs,
+                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                                prev_action * self.mask,
+                                prev_state * self.mask.unsqueeze(1))
                         memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                     else:
                         raise ValueError(f"The type must be one of lstm or trxls.")
                 else:
-                    dist, value = self.acmodel(preprocessed_obs)
+                    #dist, value = self.acmodel(preprocessed_obs)
+                    raise ValueError("Dreamer is memory-based model.")
+
             action = dist.sample()
 
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
@@ -177,6 +196,10 @@ class BaseAlgo(ABC):
                 self.rewards[i] = torch.tensor(reward, device=self.device)
             self.log_probs[i] = dist.log_prob(action)
 
+            self.states[i] = state
+            self.prev_actions[i] = prev_action
+            self.prev_states[i] = prev_state
+
             # Update log values
 
             self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
@@ -200,12 +223,17 @@ class BaseAlgo(ABC):
         with torch.no_grad():
             if self.acmodel.recurrent:
                 if self.mem_type =='lstm':
-                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    _, next_value, _, _, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                            action * self.mask,
+                            state * self.mask.unsqueeze(1))
                 else:  # transformers
-                    _, next_value, _ = self.acmodel(preprocessed_obs,
-                            (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
+                    _, next_value, _, _, _, _ = self.acmodel(preprocessed_obs,
+                            (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                            action * self.mask,
+                            state * self.mask.unsqueeze(1))
             else:
-                _, next_value = self.acmodel(preprocessed_obs)
+                #_, next_value = self.acmodel(preprocessed_obs)
+                raise ValueError("Dreamer is memory-based model.")
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
@@ -244,6 +272,10 @@ class BaseAlgo(ABC):
         exps.advantage = self.advantages.transpose(0, 1).reshape(-1)
         exps.returnn = exps.value + exps.advantage
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
+
+        exps.state = self.states.transpose(0, 1).reshape(-1, self.acmodel.semi_memory_size)
+        exps.prev_action = self.prev_actions.transpose(0, 1).reshape(-1)
+        exps.prev_state = self.prev_states.transpose(0, 1).reshape(-1, self.acmodel.semi_memory_size)
 
         # Preprocess experiences
 
