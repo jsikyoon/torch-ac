@@ -11,7 +11,9 @@ class PPOAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5, loss_type='all'):
+                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5, loss_type='agent-rep-img',
+                 combine_loss=False,
+                 lr_rep=0.001, lr_img=8e-5, clip_dreamer=100.0):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
@@ -22,17 +24,43 @@ class PPOAlgo(BaseAlgo):
         self.epochs = epochs
         self.batch_size = batch_size
         self.mem_type = mem_type
-        self.loss_type = loss_type
+        self.loss_type = loss_type.split('-')
+        self.combine_loss = combine_loss
+        self.clip_dreamer = clip_dreamer
 
         assert self.batch_size % self.recurrence == 0
 
-        self.optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, eps=adam_eps)
+        self.agent_optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, eps=adam_eps)
+        self.rep_optimizer = torch.optim.Adam(self.acmodel.parameters(), lr_rep)
+        self.img_optimizer = torch.optim.Adam(self.acmodel.parameters(), lr_img)
         self.batch_num = 0
 
     def update_parameters(self, exps):
         # Collect experiences
 
+        ################################################################
+        # Agent (ppo)
+        ################################################################
+
+        # set recurrence = 1 when doesn't train representation modules on here
+
+        if ('rep' in self.loss_type) and (not self.combine_loss):
+            recurrence = 1
+        else:
+            recurrence = self.recurrence
+
         for _ in range(self.epochs):
+
+            # do not update through ppo algorithm
+
+            if not 'agent' in self.loss_type:
+                log_entropies = [0]
+                log_values = [0]
+                log_policy_losses = [0]
+                log_value_losses = [0]
+                log_grad_norms = [0]
+                break
+
             # Initialize log values
 
             log_entropies = []
@@ -41,16 +69,7 @@ class PPOAlgo(BaseAlgo):
             log_value_losses = []
             log_grad_norms = []
 
-            log_rep_losses = []
-            log_recon_losses = []
-            log_reward_losses = []
-            log_kl_losses = []
-
-            log_img_losses = []
-            log_img_policy_losses = []
-            log_img_value_losses = []
-
-            for inds in self._get_batches_starting_indexes():
+            for inds in self._get_batches_starting_indexes(recurrence):
                 # Initialize batch values
 
                 batch_entropy = 0
@@ -59,49 +78,32 @@ class PPOAlgo(BaseAlgo):
                 batch_value_loss = 0
                 batch_loss = 0
 
-                batch_rep_loss = 0
-                batch_recon_loss = 0
-                batch_reward_loss = 0
-                batch_kl_loss = 0
-
-                batch_img_loss = 0
-                batch_img_policy_loss = 0
-                batch_img_value_loss = 0
-
                 # Initialize memory
 
                 if self.acmodel.recurrent:
                     memory = exps.memory[inds]
-                    action = exps.prev_action[inds]
                     state = exps.prev_state[inds]
 
-                for i in range(self.recurrence):
+                for i in range(recurrence):
                     # Create a sub-batch of experience
 
                     sb = exps[inds + i]
+                    action = exps.prev_action[inds + i]
 
                     # Compute loss
 
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
-                            dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, memory * sb.mask,
+                            dist, value, memory, state, _, _ = self.acmodel(sb.obs, memory * sb.mask,
                                     action * sb.mask[:,0],
-                                    state * sb.mask,
-                                    sb.reward,
-                                    get_rep_loss=True,
-                                    get_img_loss=True)
+                                    state * sb.mask)
                         else: # transformers
-                            dist, value, memory, state, rep_loss, img_loss = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
+                            dist, value, memory, state, _, _ = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
                                     action * sb.mask[:,0,0,0],
-                                    state * sb.mask[:,:,0,0],
-                                    sb.reward,
-                                    get_rep_loss=True,
-                                    get_img_loss=True)
+                                    state * sb.mask[:,:,0,0])
                     else:
                         #dist, value = self.acmodel(sb.obs)
                         raise ValueError("Dreamer is memory-based model.")
-
-                    action = dist.sample()
 
                     entropy = dist.entropy().mean()
 
@@ -123,28 +125,11 @@ class PPOAlgo(BaseAlgo):
                     batch_value += value.mean().item()
                     batch_policy_loss += policy_loss.item()
                     batch_value_loss += value_loss.item()
-                    if self.loss_type in ['all', 'rep-agent']:
-                        batch_loss += loss
-
-                    # Update representation losses
-
-                    batch_rep_loss += rep_loss['rep_loss'].item()
-                    batch_recon_loss += rep_loss['recon_loss'].item()
-                    batch_reward_loss += rep_loss['reward_loss'].item()
-                    batch_kl_loss += rep_loss['kl_loss'].item()
-                    batch_loss += rep_loss['rep_loss']
-
-                    # Update imaginary losses
-
-                    batch_img_loss += img_loss['img_loss'].item()
-                    batch_img_policy_loss += img_loss['policy_loss'].item()
-                    batch_img_value_loss += img_loss['value_loss'].item()
-                    if self.loss_type in ['all', 'rep-img']:
-                        batch_loss += img_loss['img_loss']
+                    batch_loss += loss
 
                     # Update memories for next epoch
 
-                    if self.acmodel.recurrent and i < self.recurrence - 1:
+                    if self.acmodel.recurrent and i < recurrence - 1:
                         if 'trxl' in self.mem_type:
                             memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                         exps.memory[inds + i + 1] = memory.detach()
@@ -153,28 +138,24 @@ class PPOAlgo(BaseAlgo):
 
                 # Update batch values
 
-                batch_entropy /= self.recurrence
-                batch_value /= self.recurrence
-                batch_policy_loss /= self.recurrence
-                batch_value_loss /= self.recurrence
-                batch_loss /= self.recurrence
-
-                batch_rep_loss /= self.recurrence
-                batch_recon_loss /= self.recurrence
-                batch_reward_loss /= self.recurrence
-                batch_kl_loss /= self.recurrence
-
-                batch_img_loss /= self.recurrence
-                batch_img_policy_loss /= self.recurrence
-                batch_img_value_loss /= self.recurrence
+                batch_entropy /= recurrence
+                batch_value /= recurrence
+                batch_policy_loss /= recurrence
+                batch_value_loss /= recurrence
+                batch_loss /= recurrence
 
                 # Update actor-critic
 
-                self.optimizer.zero_grad()
+                self.agent_optimizer.zero_grad()
                 batch_loss.backward()
-                grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.acmodel.parameters()) ** 0.5
+                grad_norm = 0
+                for p in self.acmodel.parameters():
+                    if p.grad is not None:
+                        grad_norm += p.grad.data.norm(2).item() ** 2
+                grad_norm = grad_norm ** 0.5
+                #grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.acmodel.parameters()) ** 0.5
                 torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                self.agent_optimizer.step()
 
                 # Update log values
 
@@ -184,14 +165,258 @@ class PPOAlgo(BaseAlgo):
                 log_value_losses.append(batch_value_loss)
                 log_grad_norms.append(grad_norm)
 
-                log_rep_losses.append(batch_rep_loss)
-                log_recon_losses.append(batch_recon_loss)
-                log_reward_losses.append(batch_reward_loss)
-                log_kl_losses.append(batch_kl_loss)
+        ################################################################
+        # Representation of Dreamer
+        ################################################################
 
-                log_img_losses.append(batch_img_loss)
-                log_img_policy_losses.append(batch_img_policy_loss)
-                log_img_value_losses.append(batch_img_value_loss)
+        log_rep_losses = []
+        log_recon_accs = []
+        log_recon_losses = []
+        log_recon_col_losses = []
+        log_recon_obj_losses = []
+        log_recon_state_losses = []
+        log_reward_losses = []
+        log_nonzero_reward_losses = []
+        log_nonzero_reward_num = []
+        log_zero_reward_losses = []
+        log_zero_reward_num = []
+        log_kl_losses = []
+
+        # set recurrence = 1 when doesn't train representation modules on here
+
+        if not 'rep' in self.loss_type:
+            recurrence = 1
+        else:
+            recurrence = self.recurrence
+
+        for inds in self._get_batches_starting_indexes(recurrence):
+            # do not update through imaginary agent algorithm
+
+            if (not 'rep' in self.loss_type) and (not 'img' in self.loss_type):
+
+                log_rep_losses = [0]
+                log_recon_accs = [0]
+                log_recon_losses = [0]
+                log_recon_col_losses = [0]
+                log_recon_obj_losses = [0]
+                log_recon_state_losses = [0]
+                log_reward_losses = [0]
+                log_nonzero_reward_losses = [0]
+                log_nonzero_reward_num = [0]
+                log_zero_reward_losses = [0]
+                log_zero_reward_num = [0]
+                log_kl_losses = [0]
+
+                break
+
+            # Initialize batch values
+
+            update_rep_loss = 0
+            update_recon_acc = 0
+            update_recon_loss = 0
+            update_recon_col_loss = 0
+            update_recon_obj_loss = 0
+            update_recon_state_loss = 0
+            update_reward_loss = 0
+            update_nonzero_reward_loss = 0
+            update_nonzero_reward_num = 0
+            update_zero_reward_loss = 0
+            update_zero_reward_num = 0
+            update_kl_loss = 0
+
+            # Initialize memory
+
+            if self.acmodel.recurrent:
+                memory = exps.memory[inds]
+                action = exps.prev_action[inds]
+                state = exps.prev_state[inds]
+
+            for i in range(recurrence):
+                # Create a sub-batch of experience
+
+                sb = exps[inds + i]
+                action = exps.prev_action[inds + i]
+
+                # Compute loss
+
+                if self.acmodel.recurrent:
+                    if self.mem_type == 'lstm':
+                        dist, value, memory, state, rep_loss, _ = self.acmodel(sb.obs, memory * sb.mask,
+                                action * sb.mask[:,0],
+                                state * sb.mask,
+                                sb.reward,
+                                get_rep_loss=True)
+                    else: # transformers
+                        dist, value, memory, state, rep_loss, _ = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
+                                action * sb.mask[:,0,0,0],
+                                state * sb.mask[:,:,0,0],
+                                sb.reward,
+                                get_rep_loss=True)
+                else:
+                    #dist, value = self.acmodel(sb.obs)
+                    raise ValueError("Dreamer is memory-based model.")
+
+                # Update representation losses
+
+                update_rep_loss += rep_loss['rep_loss']
+                update_recon_acc += rep_loss['recon_acc']
+                update_recon_loss += rep_loss['recon_loss'].item()
+                update_recon_col_loss += rep_loss['recon_col_loss'].item()
+                update_recon_obj_loss += rep_loss['recon_obj_loss'].item()
+                update_recon_state_loss += rep_loss['recon_state_loss'].item()
+                update_reward_loss += rep_loss['reward_loss']
+                update_nonzero_reward_loss += rep_loss['nonzero_reward_loss']
+                update_nonzero_reward_num += rep_loss['nonzero_reward_num']
+                update_zero_reward_loss += rep_loss['zero_reward_loss']
+                update_zero_reward_num += rep_loss['zero_reward_num']
+                update_kl_loss += rep_loss['kl_loss'].item()
+
+                # Update memories for next epoch
+
+                if self.acmodel.recurrent and i < recurrence - 1:
+                    if 'trxl' in self.mem_type:
+                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                    exps.memory[inds + i + 1] = memory.detach()
+                    exps.prev_state[inds + i + 1] = state.detach()
+
+            # Update update values
+
+            update_rep_loss /= recurrence
+            update_recon_acc /= recurrence
+            update_recon_loss /= recurrence
+            update_recon_col_loss /= recurrence
+            update_recon_obj_loss /= recurrence
+            update_recon_state_loss /= recurrence
+            update_reward_loss /= recurrence
+            update_nonzero_reward_loss /= recurrence
+            #update_nonzero_reward_num /= recurrence
+            update_zero_reward_loss /= recurrence
+            #update_zero_reward_num /= recurrence
+            update_kl_loss /= recurrence
+
+            # Update representation modules
+
+            if 'rep' in self.loss_type:
+                self.rep_optimizer.zero_grad()
+                update_rep_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.clip_dreamer)
+                self.rep_optimizer.step()
+            else:
+                self.rep_optimizer.zero_grad()
+                update_reward_loss.backward() # only training reward decoder for imaginary agent update
+                torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.clip_dreamer)
+                self.rep_optimizer.step()
+
+            # Update log values
+
+            log_rep_losses.append(update_rep_loss.item())
+            log_recon_accs.append(update_recon_acc)
+            log_recon_losses.append(update_recon_loss)
+            log_recon_col_losses.append(update_recon_col_loss)
+            log_recon_obj_losses.append(update_recon_obj_loss)
+            log_recon_state_losses.append(update_recon_state_loss)
+            log_reward_losses.append(update_reward_loss.item())
+            log_nonzero_reward_losses.append(update_nonzero_reward_loss)
+            log_nonzero_reward_num.append(update_nonzero_reward_num)
+            log_zero_reward_losses.append(update_zero_reward_loss)
+            log_zero_reward_num.append(update_zero_reward_num)
+            log_kl_losses.append(update_kl_loss)
+
+        ################################################################
+        # Imaginary agent of Dreamer
+        ################################################################
+
+        log_img_losses = []
+        log_img_policy_losses = []
+        log_img_value_losses = []
+
+        # set recurrence = 1 when doesn't train representation modules on here
+
+        if ('rep' in self.loss_type) and (not self.combine_loss):
+            recurrence = 1
+        else:
+            recurrence = self.recurrence
+
+        for inds in self._get_batches_starting_indexes(recurrence):
+            # do not update through imaginary agent algorithm
+
+            if not 'img' in self.loss_type:
+
+                log_img_losses = [0]
+                log_img_policy_losses = [0]
+                log_img_value_losses = [0]
+
+                break
+
+            # Initialize batch values
+
+            update_img_loss = 0
+            update_img_policy_loss = 0
+            update_img_value_loss = 0
+
+            # Initialize memory
+
+            if self.acmodel.recurrent:
+                memory = exps.memory[inds]
+                action = exps.prev_action[inds]
+                state = exps.prev_state[inds]
+
+            for i in range(recurrence):
+                # Create a sub-batch of experience
+
+                sb = exps[inds + i]
+                action = exps.prev_action[inds + i]
+
+                # Compute loss
+
+                if self.acmodel.recurrent:
+                    if self.mem_type == 'lstm':
+                        dist, value, memory, state, _, img_loss = self.acmodel(sb.obs, memory * sb.mask,
+                                action * sb.mask[:,0],
+                                state * sb.mask,
+                                get_img_loss=True)
+                    else: # transformers
+                        dist, value, memory, state, _, img_loss = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3),
+                                action * sb.mask[:,0,0,0],
+                                state * sb.mask[:,:,0,0],
+                                get_img_loss=True)
+                else:
+                    #dist, value = self.acmodel(sb.obs)
+                    raise ValueError("Dreamer is memory-based model.")
+
+                # Update imaginary losses
+
+                update_img_loss += img_loss['img_loss']
+                update_img_policy_loss += img_loss['policy_loss'].item()
+                update_img_value_loss += img_loss['value_loss'].item()
+
+                # Update memories for next epoch
+
+                if self.acmodel.recurrent and i < recurrence - 1:
+                    if 'trxl' in self.mem_type:
+                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                    exps.memory[inds + i + 1] = memory.detach()
+                    exps.prev_state[inds + i + 1] = state.detach()
+
+            # Update update values
+
+            update_img_loss /= recurrence
+            update_img_policy_loss /= recurrence
+            update_img_value_loss /= recurrence
+
+            # Update actor-critic
+
+            if 'img' in self.loss_type:
+                self.img_optimizer.zero_grad()
+                update_img_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.clip_dreamer)
+                self.img_optimizer.step()
+
+            # Update log values
+
+            log_img_losses.append(update_img_loss.item())
+            log_img_policy_losses.append(update_img_policy_loss)
+            log_img_value_losses.append(update_img_value_loss)
 
         # Log some values
 
@@ -203,8 +428,16 @@ class PPOAlgo(BaseAlgo):
             "grad_norm": numpy.mean(log_grad_norms),
 
             "rep_loss": numpy.mean(log_rep_losses),
+            "recon_acc": numpy.mean(log_recon_accs),
             "recon_loss": numpy.mean(log_recon_losses),
+            "recon_col_loss": numpy.mean(log_recon_col_losses),
+            "recon_obj_loss": numpy.mean(log_recon_obj_losses),
+            "recon_state_loss": numpy.mean(log_recon_state_losses),
             "reward_loss": numpy.mean(log_reward_losses),
+            "nonzero_reward_loss": numpy.mean(log_nonzero_reward_losses),
+            "nonzero_reward_num": numpy.sum(log_nonzero_reward_num),
+            "zero_reward_loss": numpy.mean(log_zero_reward_losses),
+            "zero_reward_num": numpy.sum(log_zero_reward_num),
             "kl_loss": numpy.mean(log_kl_losses),
 
             "img_loss": numpy.mean(log_img_losses),
@@ -214,7 +447,7 @@ class PPOAlgo(BaseAlgo):
 
         return logs
 
-    def _get_batches_starting_indexes(self):
+    def _get_batches_starting_indexes(self, recurrence):
         """Gives, for each batch, the indexes of the observations given to
         the model and the experiences used to compute the loss at first.
 
@@ -228,16 +461,16 @@ class PPOAlgo(BaseAlgo):
             the indexes of the experiences to be used at first for each batch
         """
 
-        indexes = numpy.arange(0, self.num_frames, self.recurrence)
+        indexes = numpy.arange(0, self.num_frames, recurrence)
         indexes = numpy.random.permutation(indexes)
 
-        # Shift starting indexes by self.recurrence//2 half the time
+        # Shift starting indexes by recurrence//2 half the time
         if self.batch_num % 2 == 1:
-            indexes = indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]
-            indexes += self.recurrence // 2
+            indexes = indexes[(indexes + recurrence) % self.num_frames_per_proc != 0]
+            indexes += recurrence // 2
         self.batch_num += 1
 
-        num_indexes = self.batch_size // self.recurrence
+        num_indexes = self.batch_size // recurrence
         batches_starting_indexes = [indexes[i:i+num_indexes] for i in range(0, len(indexes), num_indexes)]
 
         return batches_starting_indexes
