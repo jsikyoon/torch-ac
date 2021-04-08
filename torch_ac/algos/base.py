@@ -157,11 +157,11 @@ class BaseAlgo(ABC):
             with torch.no_grad():
                 if self.acmodel.recurrent:
                     if self.mem_type == 'lstm':
-                        dist, value, memory, state, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
                                 prev_action * self.mask,
                                 prev_state * self.mask.unsqueeze(1))
                     elif 'trxl' in self.mem_type:  # transformers
-                        dist, value, memory, state, _, _ = self.acmodel(preprocessed_obs,
+                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs,
                                 (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
                                 prev_action * self.mask,
                                 prev_state * self.mask.unsqueeze(1))
@@ -223,11 +223,11 @@ class BaseAlgo(ABC):
         with torch.no_grad():
             if self.acmodel.recurrent:
                 if self.mem_type =='lstm':
-                    _, next_value, _, _, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                    _, next_value, _, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
                             action * self.mask,
                             state * self.mask.unsqueeze(1))
                 else:  # transformers
-                    _, next_value, _, _, _, _ = self.acmodel(preprocessed_obs,
+                    _, next_value, _, _, _ = self.acmodel(preprocessed_obs,
                             (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
                             action * self.mask,
                             state * self.mask.unsqueeze(1))
