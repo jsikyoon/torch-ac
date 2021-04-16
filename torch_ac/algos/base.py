@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import torch
+import numpy as np
 
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
@@ -53,6 +54,7 @@ class BaseAlgo(ABC):
         # Store parameters
 
         self.env = ParallelEnv(envs)
+        self.envs = envs # For selected trajectories
         self.acmodel = acmodel
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
@@ -144,74 +146,248 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
         """
 
-        for i in range(self.num_frames_per_proc):
-            # Do one agent-environment interaction
+        if False:  # selected trajectories
 
-            preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
-            with torch.no_grad():
-                if self.acmodel.recurrent:
-                    if self.mem_type == 'lstm':
-                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
-                                self.prev_action * self.mask,
-                                self.prev_state * self.mask.unsqueeze(1))
-                    elif 'trxl' in self.mem_type:  # transformers
-                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs,
-                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
-                                self.prev_action * self.mask,
-                                self.prev_state * self.mask.unsqueeze(1))
-                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+            max_step = 10
+            self.obss = []
+
+            for b in range(len(self.envs)):
+
+                obss = []
+                memories = []
+                masks = []
+                actions = []
+                values = []
+                rewards = []
+                log_probs = []
+                prev_actions = []
+                prev_states = []
+
+                log_done_counter = 0
+
+                log_return = []
+                log_reshaped_return = []
+                log_num_frames = []
+
+                while True: # repeat to num_frames_per_proc
+              
+                    if self.num_frames_per_proc - len(obss) < max_step:
+                        _max_step = self.num_frames_per_proc - len(obss)
+                        last_episode = True
                     else:
-                        raise ValueError(f"The type must be one of lstm or trxls.")
+                        _max_step = max_step
+                        last_episode = False
+
+                    while True: # to find good trajectories
+
+                        env = self.envs[b]
+                        obs = env.reset()
+
+                        _obss = []
+                        _memories = []
+                        _masks = []
+                        _actions = []
+                        _values = []
+                        _rewards = []
+                        _log_probs = []
+                        _prev_actions = []
+                        _prev_states = []
+
+                        _log_done_counter = 0
+                        _log_episode_return = 0
+                        _log_episode_reshaped_return = 0
+                        _log_episode_num_frames = 0
+
+                        _log_return = []
+                        _log_reshaped_return = []
+                        _log_num_frames = []
+
+                        if self.mem_type == 'lstm':
+                            memory = torch.zeros(1, self.acmodel.memory_size, device=self.device)
+                        else: # transformer
+                            memory = torch.zeros(1, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
+
+                        prev_action = torch.zeros(1, device=self.device, dtype=torch.int64)
+                        prev_state = torch.zeros(1, self.acmodel.semi_memory_size, device=self.device)
+
+                        mask = torch.ones(1, device=self.device)
+
+                        for i in range(_max_step):
+
+                            _obss.append(obs)
+                            _memories.append(memory)
+                            _masks.append(mask)
+
+                            preprocessed_obs = self.preprocess_obss([obs], device=self.device)
+
+                            with torch.no_grad():
+                                if self.acmodel.recurrent:
+                                    if self.mem_type == 'lstm':
+                                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs, memory,
+                                                prev_action,
+                                                prev_state)
+                                    elif 'trxl' in self.mem_type:  # transformers
+                                        dist, value, memory, state, _ = self.acmodel(preprocessed_obs,
+                                                memory.permute(1,2,0,3),
+                                                prev_action,
+                                                prev_state)
+                                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                                    else:
+                                        raise ValueError(f"The type must be one of lstm or trxls.")
+                                else:
+                                    #dist, value = self.acmodel(preprocessed_obs)
+                                    raise ValueError("Dreamer is memory-based model.")
+
+                            action = np.random.randint(7, size=1)
+                            obs, reward, done, _ = env.step(action)
+                            action = torch.Tensor(action).to(value.device)
+
+                            mask = 1 - torch.tensor([done], device=self.device, dtype=torch.float)
+                            
+                            _actions.append(action)
+                            _values.append(value)
+                            if self.reshape_reward is not None:
+                                raise NotImplemented
+                            else:
+                                _rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float)) # reward reshape is not used
+                            _log_probs.append(dist.log_prob(action))
+                            _prev_actions.append(prev_action)
+                            prev_action = action
+                            _prev_states.append(prev_state)
+                            prev_state = state
+
+                            # Update log values
+
+                            _log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
+                            _log_episode_reshaped_return += _rewards[-1]
+                            _log_episode_num_frames += torch.ones(1, device=self.device)
+
+                            if done:
+                                _log_done_counter += 1
+                                _log_return.append(_log_episode_return.item())
+                                _log_reshaped_return.append(_log_episode_reshaped_return.item())
+                                _log_num_frames.append(_log_episode_num_frames.item())
+                                break
+
+                        if done:
+                            break
+
+                        if last_episode:
+                            break
+
+                    # Append the results
+
+                    obss.extend(_obss)
+                    memories.extend(_memories)
+                    masks.extend(_masks)
+                    actions.extend(_actions)
+                    values.extend(_values)
+                    rewards.extend(_rewards)
+                    log_probs.extend(_log_probs)
+                    prev_actions.extend(_prev_actions)
+                    prev_states.extend(_prev_states)
+
+                    log_done_counter += _log_done_counter
+
+                    log_return.extend(_log_return)
+                    log_reshaped_return.extend(_log_reshaped_return)
+                    log_num_frames.extend(_log_num_frames)
+
+                    if len(obss) == self.num_frames_per_proc:
+                        break
+
+                self.obss.append(obss)
+                self.memories[:,b] = torch.cat(memories, dim=0)
+                self.masks[:,b] = torch.cat(masks, dim=0)
+                self.actions[:,b] = torch.cat(actions, dim=0)
+                self.values[:,b] = torch.cat(values, dim=0)
+                self.rewards[:,b] = torch.stack(rewards, dim=0)
+                self.log_probs[:,b] = torch.cat(log_probs, dim=0)
+                self.prev_actions[:,b] = torch.cat(prev_actions, dim=0)
+                self.prev_states[:,b] = torch.cat(prev_states, dim=0)
+
+                self.log_done_counter += log_done_counter
+
+                self.log_return.extend(log_return)
+                self.log_reshaped_return.extend(log_reshaped_return)
+                self.log_num_frames.extend(log_num_frames)
+
+            self.obss = np.array(self.obss).T.tolist()
+     
+        else:
+
+            for i in range(self.num_frames_per_proc):
+                # Do one agent-environment interaction
+
+                preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
+
+                with torch.no_grad():
+                    if self.acmodel.recurrent:
+                        if self.mem_type == 'lstm':
+                            dist, value, memory, state, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                                    self.prev_action * self.mask,
+                                    self.prev_state * self.mask.unsqueeze(1))
+                        elif 'trxl' in self.mem_type:  # transformers
+                            dist, value, memory, state, _ = self.acmodel(preprocessed_obs,
+                                    (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                                    self.prev_action * self.mask,
+                                    self.prev_state * self.mask.unsqueeze(1))
+                            memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                        else:
+                            raise ValueError(f"The type must be one of lstm or trxls.")
+                    else:
+                        #dist, value = self.acmodel(preprocessed_obs)
+                        raise ValueError("Dreamer is memory-based model.")
+
+                #action = dist.sample()
+                #obs, reward, done, _ = self.env.step(action.cpu().numpy())
+
+                action = np.random.randint(7, size=16)
+                obs, reward, done, _ = self.env.step(action)
+                action = torch.Tensor(action).to(value.device)
+
+                # Update experiences values
+
+                self.obss[i] = self.obs
+                self.obs = obs
+                if self.acmodel.recurrent:
+                    self.memories[i] = self.memory
+                    self.memory = memory
+                self.masks[i] = self.mask
+                self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
+                self.actions[i] = action
+                self.values[i] = value
+                if self.reshape_reward is not None:
+                    self.rewards[i] = torch.tensor([
+                        self.reshape_reward(obs_, action_, reward_, done_)
+                        for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
+                    ], device=self.device)
                 else:
-                    #dist, value = self.acmodel(preprocessed_obs)
-                    raise ValueError("Dreamer is memory-based model.")
+                    self.rewards[i] = torch.tensor(reward, device=self.device)
+                self.log_probs[i] = dist.log_prob(action)
 
-            action = dist.sample()
+                self.states[i] = state
+                self.prev_actions[i] = self.prev_action
+                self.prev_action = action
+                self.prev_states[i] = self.prev_state
+                self.prev_state = state
 
-            obs, reward, done, _ = self.env.step(action.cpu().numpy())
+                # Update log values
 
-            # Update experiences values
+                self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
+                self.log_episode_reshaped_return += self.rewards[i]
+                self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
 
-            self.obss[i] = self.obs
-            self.obs = obs
-            if self.acmodel.recurrent:
-                self.memories[i] = self.memory
-                self.memory = memory
-            self.masks[i] = self.mask
-            self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
-            self.actions[i] = action
-            self.values[i] = value
-            if self.reshape_reward is not None:
-                self.rewards[i] = torch.tensor([
-                    self.reshape_reward(obs_, action_, reward_, done_)
-                    for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
-                ], device=self.device)
-            else:
-                self.rewards[i] = torch.tensor(reward, device=self.device)
-            self.log_probs[i] = dist.log_prob(action)
+                for i, done_ in enumerate(done):
+                    if done_:
+                        self.log_done_counter += 1
+                        self.log_return.append(self.log_episode_return[i].item())
+                        self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
+                        self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
-            self.states[i] = state
-            self.prev_actions[i] = self.prev_action
-            self.prev_action = action
-            self.prev_states[i] = self.prev_state
-            self.prev_state = state
-
-            # Update log values
-
-            self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
-            self.log_episode_reshaped_return += self.rewards[i]
-            self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
-
-            for i, done_ in enumerate(done):
-                if done_:
-                    self.log_done_counter += 1
-                    self.log_return.append(self.log_episode_return[i].item())
-                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
-                    self.log_num_frames.append(self.log_episode_num_frames[i].item())
-
-            self.log_episode_return *= self.mask
-            self.log_episode_reshaped_return *= self.mask
-            self.log_episode_num_frames *= self.mask
+                self.log_episode_return *= self.mask
+                self.log_episode_reshaped_return *= self.mask
+                self.log_episode_num_frames *= self.mask
 
         # Add advantage and return to experiences
 

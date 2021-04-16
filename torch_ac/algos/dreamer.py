@@ -52,10 +52,13 @@ class DREAMERAlgo(BaseAlgo):
                 log_recon_col_losses = []
                 log_recon_obj_losses = []
                 log_recon_state_losses = []
-                log_reward_losses = []
-                log_nonzero_reward_losses = []
+                log_reward_mse = []
+                log_reward_logprob = []
+                log_nonzero_reward_mse = []
+                log_nonzero_reward_logprob = []
                 log_nonzero_reward_num = []
-                log_zero_reward_losses = []
+                log_zero_reward_mse = []
+                log_zero_reward_logprob = []
                 log_zero_reward_num = []
                 log_kl_losses = []
 
@@ -69,10 +72,13 @@ class DREAMERAlgo(BaseAlgo):
                     update_recon_col_loss = 0
                     update_recon_obj_loss = 0
                     update_recon_state_loss = 0
-                    update_reward_loss = 0
-                    update_nonzero_reward_loss = 0
+                    update_reward_mse = 0
+                    update_reward_logprob = 0
+                    update_nonzero_reward_mse = 0
+                    update_nonzero_reward_logprob = 0
                     update_nonzero_reward_num = 0
-                    update_zero_reward_loss = 0
+                    update_zero_reward_mse = 0
+                    update_zero_reward_logprob = 0
                     update_zero_reward_num = 0
                     update_kl_loss = 0
 
@@ -120,10 +126,13 @@ class DREAMERAlgo(BaseAlgo):
                         update_recon_col_loss += rep_loss['recon_col_loss'].item()
                         update_recon_obj_loss += rep_loss['recon_obj_loss'].item()
                         update_recon_state_loss += rep_loss['recon_state_loss'].item()
-                        update_reward_loss += rep_loss['reward_loss']
-                        update_nonzero_reward_loss += rep_loss['nonzero_reward_loss']
+                        update_reward_mse += rep_loss['reward_mse']
+                        update_reward_logprob += rep_loss['reward_logprob']
+                        update_nonzero_reward_mse += rep_loss['nonzero_reward_mse']
+                        update_nonzero_reward_logprob += rep_loss['nonzero_reward_logprob']
                         update_nonzero_reward_num += rep_loss['nonzero_reward_num']
-                        update_zero_reward_loss += rep_loss['zero_reward_loss']
+                        update_zero_reward_mse += rep_loss['zero_reward_mse']
+                        update_zero_reward_logprob += rep_loss['zero_reward_logprob']
                         update_zero_reward_num += rep_loss['zero_reward_num']
                         update_kl_loss += rep_loss['kl_loss'].item()
 
@@ -155,10 +164,21 @@ class DREAMERAlgo(BaseAlgo):
                     update_recon_col_loss /= self.recurrence
                     update_recon_obj_loss /= self.recurrence
                     update_recon_state_loss /= self.recurrence
-                    update_reward_loss /= self.recurrence
-                    update_nonzero_reward_loss /= self.recurrence
+                    update_reward_mse /= self.recurrence
+                    update_reward_logprob /= self.recurrence
+                    if update_nonzero_reward_num != 0:
+                        update_nonzero_reward_mse /= update_nonzero_reward_num
+                        update_nonzero_reward_logprob /= update_nonzero_reward_num
+                    else:
+                        update_nonzero_reward_mse = float('nan')
+                        update_nonzero_reward_logprob = float('nan')
                     #update_nonzero_reward_num /= self.recurrence
-                    update_zero_reward_loss /= self.recurrence
+                    if update_zero_reward_num != 0:
+                        update_zero_reward_mse /= update_zero_reward_num
+                        update_zero_reward_logprob /= update_zero_reward_num
+                    else:
+                        update_zero_reward_mse = float('nan')
+                        update_zero_reward_logprob = float('nan')
                     #update_zero_reward_num /= self.recurrence
                     update_kl_loss /= self.recurrence
 
@@ -177,10 +197,13 @@ class DREAMERAlgo(BaseAlgo):
                 log_recon_col_losses.append(update_recon_col_loss)
                 log_recon_obj_losses.append(update_recon_obj_loss)
                 log_recon_state_losses.append(update_recon_state_loss)
-                log_reward_losses.append(update_reward_loss.item())
-                log_nonzero_reward_losses.append(update_nonzero_reward_loss)
+                log_reward_mse.append(update_reward_mse.item())
+                log_reward_logprob.append(update_reward_logprob.item())
+                log_nonzero_reward_mse.append(update_nonzero_reward_mse)
+                log_nonzero_reward_logprob.append(update_nonzero_reward_logprob)
                 log_nonzero_reward_num.append(update_nonzero_reward_num)
-                log_zero_reward_losses.append(update_zero_reward_loss)
+                log_zero_reward_mse.append(update_zero_reward_mse)
+                log_zero_reward_logprob.append(update_zero_reward_logprob)
                 log_zero_reward_num.append(update_zero_reward_num)
                 log_kl_losses.append(update_kl_loss)
 
@@ -274,8 +297,6 @@ class DREAMERAlgo(BaseAlgo):
                 _inds = numpy.array(_inds)
                 exps.memory[_inds + i + 1] = torch.stack(_memory, dim=0)
                 exps.prev_state[_inds + i + 1] = torch.stack(_state, dim=0)
-                if 'trxl' in self.mem_type:
-                    memory = torch.stack(memory,dim=0).permute(1,2,0,3)
 
                 for i in range(1,imagination):
                     # Create a sub-batch of experience
@@ -293,10 +314,11 @@ class DREAMERAlgo(BaseAlgo):
                                     get_prior=True)
                         else: # transformers
                             dist, value, memory, state, _ = self.acmodel(sb.obs,
-                                    memory,
+                                    memory.permute(1,2,0,3),
                                     actions[-1],
                                     states[-1],
                                     get_prior=True)
+                            memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                     else:
                         #dist, value = self.acmodel(sb.obs)
                         raise ValueError("Dreamer is memory-based model.")
@@ -387,16 +409,22 @@ class DREAMERAlgo(BaseAlgo):
             "grad_norm": numpy.mean(log_grad_norms),
 
             "rep_loss": numpy.mean(log_rep_losses),
+
             "recon_acc": numpy.mean(log_recon_accs),
             "recon_loss": numpy.mean(log_recon_losses),
             "recon_col_loss": numpy.mean(log_recon_col_losses),
             "recon_obj_loss": numpy.mean(log_recon_obj_losses),
             "recon_state_loss": numpy.mean(log_recon_state_losses),
-            "reward_loss": numpy.mean(log_reward_losses),
-            "nonzero_reward_loss": numpy.mean(log_nonzero_reward_losses),
+
+            "reward_mse": numpy.mean(log_reward_mse),
+            "reward_logprob": numpy.mean(log_reward_logprob),
+            "nonzero_reward_mse": numpy.mean(log_nonzero_reward_mse),
+            "nonzero_reward_logprob": numpy.mean(log_nonzero_reward_logprob),
             "nonzero_reward_num": numpy.sum(log_nonzero_reward_num),
-            "zero_reward_loss": numpy.mean(log_zero_reward_losses),
+            "zero_reward_mse": numpy.mean(log_zero_reward_mse),
+            "zero_reward_logprob": numpy.mean(log_zero_reward_logprob),
             "zero_reward_num": numpy.sum(log_zero_reward_num),
+
             "kl_loss": numpy.mean(log_kl_losses),
         }
 
