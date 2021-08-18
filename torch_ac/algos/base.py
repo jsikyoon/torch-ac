@@ -85,6 +85,7 @@ class BaseAlgo(ABC):
 
         self.num_procs = len(envs)
         self.num_frames = self.num_frames_per_proc * self.num_procs
+        self.num_frames_for_selection = self.num_frames_per_proc * self.num_procs
 
         # Initialize experience values
 
@@ -146,10 +147,11 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
         """
 
-        if False:  # selected trajectories
+        if True:  # selected trajectories
 
-            max_step = 10
+            max_step = 64
             self.obss = []
+            num_frames = 0
 
             for b in range(len(self.envs)):
 
@@ -210,7 +212,7 @@ class BaseAlgo(ABC):
                         prev_action = torch.zeros(1, device=self.device, dtype=torch.int64)
                         prev_state = torch.zeros(1, self.acmodel.semi_memory_size, device=self.device)
 
-                        mask = torch.ones(1, device=self.device)
+                        mask = torch.zeros(1, device=self.device)
 
                         for i in range(_max_step):
 
@@ -261,6 +263,9 @@ class BaseAlgo(ABC):
                             _log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
                             _log_episode_reshaped_return += _rewards[-1]
                             _log_episode_num_frames += torch.ones(1, device=self.device)
+
+                            # Update count
+                            num_frames += 1
 
                             if done:
                                 _log_done_counter += 1
@@ -313,6 +318,8 @@ class BaseAlgo(ABC):
                 self.log_num_frames.extend(log_num_frames)
 
             self.obss = np.array(self.obss).T.tolist()
+
+            self.num_frames_for_selection = num_frames
      
         else:
 
@@ -461,7 +468,8 @@ class BaseAlgo(ABC):
             "return_per_episode": self.log_return[-keep:],
             "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
             "num_frames_per_episode": self.log_num_frames[-keep:],
-            "num_frames": self.num_frames
+            "num_frames": self.num_frames,
+            "num_frames_for_selection": self.num_frames_for_selection
         }
 
         self.log_done_counter = 0
