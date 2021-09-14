@@ -9,7 +9,7 @@ class BaseAlgo(ABC):
 
     def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                 mem_type, mem_len, n_layer):
+                 mem_type, mem_len, n_layer, img_encode):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -48,11 +48,13 @@ class BaseAlgo(ABC):
             the length of memory
         n_layer : int
             layers of memory module
+        img_encode : Boolean
+            Encoding image or compact map
         """
 
         # Store parameters
 
-        self.env = ParallelEnv(envs)
+        self.env = ParallelEnv(envs, img_encode)
         self.acmodel = acmodel
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
@@ -103,6 +105,7 @@ class BaseAlgo(ABC):
         self.values = torch.zeros(*shape, device=self.device)
         self.rewards = torch.zeros(*shape, device=self.device)
         self.advantages = torch.zeros(*shape, device=self.device)
+        self.img_encode = img_encode
         self.log_probs = torch.zeros(*shape, device=self.device)
 
         # Initialize log values
