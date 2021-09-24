@@ -9,7 +9,7 @@ class BaseAlgo(ABC):
 
     def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                 mem_type, mem_len, n_layer, img_encode):
+                 mem_type, ext_len, mem_len, n_layer, img_encode):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -68,6 +68,7 @@ class BaseAlgo(ABC):
         self.preprocess_obss = preprocess_obss or default_preprocess_obss
         self.reshape_reward = reshape_reward
         self.mem_type = mem_type
+        self.ext_len = ext_len
         self.mem_len = mem_len
         self.n_layer = n_layer
 
@@ -99,6 +100,8 @@ class BaseAlgo(ABC):
             else:  # transformers
                 self.memory = torch.zeros(shape[1], self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
                 self.memories = torch.zeros(*shape, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
+                self.ext = torch.zeros(shape[1], self.ext_len, self.acmodel.image_embedding_size, device=self.device)
+                self.exts = torch.zeros(*shape, self.ext_len, self.acmodel.image_embedding_size, device=self.device)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
@@ -147,15 +150,15 @@ class BaseAlgo(ABC):
             with torch.no_grad():
                 if self.acmodel.recurrent:
                     if self.mem_type == 'lstm':
-                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                        dist, value, memory, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                     elif 'trxl' in self.mem_type:  # transformers
-                        dist, value, memory = self.acmodel(preprocessed_obs,
-                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
-                        memory = torch.stack(memory,dim=0).permute(2,0,1,3)
+                        dist, value, memory, ext = self.acmodel(preprocessed_obs,
+                                (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                                ext=(self.ext*self.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
                     else:
                         raise ValueError(f"The type must be one of lstm or trxls.")
                 else:
-                    dist, value = self.acmodel(preprocessed_obs)
+                    dist, value, _, _ = self.acmodel(preprocessed_obs)
             action = dist.sample()
 
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
@@ -167,6 +170,9 @@ class BaseAlgo(ABC):
             if self.acmodel.recurrent:
                 self.memories[i] = self.memory
                 self.memory = memory
+                if 'trxl' in self.mem_type:
+                    self.exts[i] = self.ext
+                    self.ext = ext
             self.masks[i] = self.mask
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
             self.actions[i] = action
@@ -203,12 +209,13 @@ class BaseAlgo(ABC):
         with torch.no_grad():
             if self.acmodel.recurrent:
                 if self.mem_type =='lstm':
-                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    _, next_value, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:  # transformers
-                    _, next_value, _ = self.acmodel(preprocessed_obs,
-                            (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3))
+                    _, next_value, _, _ = self.acmodel(preprocessed_obs,
+                            (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                            (self.ext*self.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
             else:
-                _, next_value = self.acmodel(preprocessed_obs)
+                _, next_value, _, _ = self.acmodel(preprocessed_obs)
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
@@ -234,12 +241,11 @@ class BaseAlgo(ABC):
         if self.acmodel.recurrent:
             # T x P x D -> P x T x D -> (P * T) x D
             exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
-            if self.mem_type == 'lstm':
-                # T x P -> P x T -> (P * T) x 1
-                exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
-            elif 'trxl' in self.mem_type:
-                # T x P -> P x T -> (P * T) x 1 x 1 x 1
-                exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            # T x P -> P x T -> (P * T)
+            exps.mask = self.masks.transpose(0, 1).reshape(-1)
+            if 'trxl' in self.mem_type:
+                # T x P x D -> P x T x D -> (P * T) x D
+                exps.ext = self.exts.transpose(0, 1).reshape(-1, *self.exts.shape[2:])
         # for all tensors below, T x P -> P x T -> P * T
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1)

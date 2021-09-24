@@ -10,12 +10,12 @@ class A2CAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, reshape_reward=None,
-                 mem_type='lstm', mem_len=10, n_layer=5, img_encode=False):
+                 mem_type='lstm', ext_len=10, mem_len=10, n_layer=5, img_encode=False):
         num_frames_per_proc = num_frames_per_proc or 8
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                          value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                         mem_type, mem_len, n_layer, img_encode)
+                         mem_type, ext_len, mem_len, n_layer, img_encode)
 
         self.mem_type = mem_type
 
@@ -39,6 +39,8 @@ class A2CAlgo(BaseAlgo):
 
         if self.acmodel.recurrent:
             memory = exps.memory[inds]
+            if 'trxl' in self.mem_type:
+                ext = exps.ext[inds]
 
         for i in range(self.recurrence):
             # Create a sub-batch of experience
@@ -48,11 +50,13 @@ class A2CAlgo(BaseAlgo):
             # Compute loss
             if self.acmodel.recurrent:
                 if self.mem_type == 'lstm':
-                    dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                    dist, value, memory, _ = self.acmodel(sb.obs, memory * sb.mask.unsqueeze(1))
                 else: # transformers
-                    dist, value, memory = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3))
+                    dist, value, memory, ext = self.acmodel(sb.obs,
+                        (memory*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                        (ext*sb.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
             else:
-                dist, value = self.acmodel(sb.obs)
+                dist, value, _, _ = self.acmodel(sb.obs)
 
             entropy = dist.entropy().mean()
 

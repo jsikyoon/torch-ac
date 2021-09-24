@@ -11,13 +11,13 @@ class PPOAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None, mem_type='lstm', mem_len=10, n_layer=5,
+                 reshape_reward=None, mem_type='lstm', ext_len=10, mem_len=10, n_layer=5,
                  img_encode=False):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                          value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                         mem_type, mem_len, n_layer, img_encode)
+                         mem_type, ext_len, mem_len, n_layer, img_encode)
 
         self.clip_eps = clip_eps
         self.epochs = epochs
@@ -54,6 +54,8 @@ class PPOAlgo(BaseAlgo):
 
                 if self.acmodel.recurrent:
                     memory = exps.memory[inds]
+                    if 'trxl' in self.mem_type:
+                        ext = exps.ext[inds]
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
@@ -64,11 +66,13 @@ class PPOAlgo(BaseAlgo):
 
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
-                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                            dist, value, memory, _ = self.acmodel(sb.obs, memory * sb.mask.unsqueeze(1))
                         else: # transformers
-                            dist, value, memory = self.acmodel(sb.obs, (memory*sb.mask).permute(1,2,0,3))
+                            dist, value, memory, ext = self.acmodel(sb.obs,
+                                (memory*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
+                                (ext*sb.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
                     else:
-                        dist, value = self.acmodel(sb.obs)
+                        dist, value, _, _ = self.acmodel(sb.obs)
 
                     entropy = dist.entropy().mean()
 
@@ -95,9 +99,9 @@ class PPOAlgo(BaseAlgo):
                     # Update memories for next epoch
 
                     if self.acmodel.recurrent and i < self.recurrence - 1:
-                        if 'trxl' in self.mem_type:
-                            memory = torch.stack(memory,dim=0).permute(2,0,1,3)
                         exps.memory[inds + i + 1] = memory.detach()
+                        if 'trxl' in self.mem_type:
+                            exps.ext[inds + i + 1] = ext.detach()
 
                 # Update batch values
 
