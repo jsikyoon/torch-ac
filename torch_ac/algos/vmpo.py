@@ -65,8 +65,6 @@ class VMPOAlgo(BaseAlgo):
 
                 if self.acmodel.recurrent:
                     memory = exps.memory[inds]
-                    if 'trxl' in self.mem_type:
-                        ext = exps.ext[inds]
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
@@ -77,11 +75,14 @@ class VMPOAlgo(BaseAlgo):
 
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
-                            dist, value, memory, _ = self.acmodel(sb.obs, memory * sb.mask.unsqueeze(1))
+                            dist, value, memory, _ = self.acmodel(sb.obs, memory * sb.mask.unsqueeze(1),
+                                sb.prev_action*sb.mask, sb.prev_reward*sb.mask)
                         else: # transformers
                             dist, value, memory, ext = self.acmodel(sb.obs,
                                 (memory*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
-                                (ext*sb.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
+                                sb.prev_action*sb.mask, sb.prev_reward*sb.mask,
+                                ext_img=sb.ext_img*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1),
+                                ext_act=sb.ext_act*sb.mask.unsqueeze(-1), ext_reward=sb.ext_reward*sb.mask.unsqueeze(-1))
                     else:
                         dist, value, _, _ = self.acmodel(sb.obs)
 

@@ -92,6 +92,7 @@ class BaseAlgo(ABC):
         shape = (self.num_frames_per_proc, self.num_procs)
 
         self.obs = self.env.reset()
+        img_shape = self.obs[0]['image'].shape
         self.obss = [None]*(shape[0])
         if self.acmodel.recurrent:
             if self.mem_type == 'lstm':
@@ -100,8 +101,12 @@ class BaseAlgo(ABC):
             else:  # transformers
                 self.memory = torch.zeros(shape[1], self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
                 self.memories = torch.zeros(*shape, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
-                self.ext = torch.zeros(shape[1], self.ext_len, self.acmodel.image_embedding_size, device=self.device)
-                self.exts = torch.zeros(*shape, self.ext_len, self.acmodel.image_embedding_size, device=self.device)
+                self.ext_img = torch.zeros(shape[1], self.ext_len, *img_shape, device=self.device)
+                self.ext_imgs = torch.zeros(*shape, self.ext_len, *img_shape, device=self.device)
+                self.ext_act = torch.zeros(shape[1], self.ext_len, device=self.device)
+                self.ext_acts = torch.zeros(*shape, self.ext_len, device=self.device)
+                self.ext_reward = torch.zeros(shape[1], self.ext_len, device=self.device)
+                self.ext_rewards = torch.zeros(*shape, self.ext_len, device=self.device)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
@@ -110,6 +115,8 @@ class BaseAlgo(ABC):
         self.advantages = torch.zeros(*shape, device=self.device)
         self.img_encode = img_encode
         self.log_probs = torch.zeros(*shape, device=self.device)
+        self.prev_actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
+        self.prev_rewards = torch.zeros(*shape, device=self.device)
 
         # Initialize log values
 
@@ -147,14 +154,19 @@ class BaseAlgo(ABC):
             # Do one agent-environment interaction
 
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
+            self.prev_actions[i] = prev_action = self.actions[i-1]
+            self.prev_rewards[i] = prev_reward = self.rewards[i-1]
             with torch.no_grad():
                 if self.acmodel.recurrent:
                     if self.mem_type == 'lstm':
-                        dist, value, memory, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                        dist, value, memory, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                                prev_action * self.mask, prev_reward * self.mask)
                     elif 'trxl' in self.mem_type:  # transformers
                         dist, value, memory, ext = self.acmodel(preprocessed_obs,
                                 (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
-                                ext=(self.ext*self.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
+                                prev_action * self.mask, prev_reward * self.mask,
+                                ext_img=self.ext_img*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1),
+                                ext_act=self.ext_act*self.mask.unsqueeze(-1), ext_reward=self.ext_reward*self.mask.unsqueeze(-1))
                     else:
                         raise ValueError(f"The type must be one of lstm or trxls.")
                 else:
@@ -171,8 +183,12 @@ class BaseAlgo(ABC):
                 self.memories[i] = self.memory
                 self.memory = memory
                 if 'trxl' in self.mem_type:
-                    self.exts[i] = self.ext
-                    self.ext = ext
+                    self.ext_imgs[i] = self.ext_img
+                    self.ext_img = ext['image']
+                    self.ext_acts[i] = self.ext_act
+                    self.ext_act = ext['action']
+                    self.ext_rewards[i] = self.ext_reward
+                    self.ext_reward = ext['reward']
             self.masks[i] = self.mask
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
             self.actions[i] = action
@@ -209,11 +225,14 @@ class BaseAlgo(ABC):
         with torch.no_grad():
             if self.acmodel.recurrent:
                 if self.mem_type =='lstm':
-                    _, next_value, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    _, next_value, _, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                            self.actions[-1] * self.mask, self.rewards[-1] * self.mask)
                 else:  # transformers
                     _, next_value, _, _ = self.acmodel(preprocessed_obs,
                             (self.memory*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
-                            (self.ext*self.mask.unsqueeze(-1).unsqueeze(-1)).permute(1,0,2))
+                            self.actions[-1] * self.mask, self.rewards[-1] * self.mask,
+                            ext_img=self.ext_img*self.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1),
+                            ext_act=self.ext_act*self.mask.unsqueeze(-1), ext_reward=self.ext_reward*self.mask.unsqueeze(-1))
             else:
                 _, next_value, _, _ = self.acmodel(preprocessed_obs)
 
@@ -245,7 +264,9 @@ class BaseAlgo(ABC):
             exps.mask = self.masks.transpose(0, 1).reshape(-1)
             if 'trxl' in self.mem_type:
                 # T x P x D -> P x T x D -> (P * T) x D
-                exps.ext = self.exts.transpose(0, 1).reshape(-1, *self.exts.shape[2:])
+                exps.ext_img = self.ext_imgs.transpose(0, 1).reshape(-1, *self.ext_imgs.shape[2:])
+                exps.ext_act = self.ext_acts.transpose(0, 1).reshape(-1, *self.ext_acts.shape[2:])
+                exps.ext_reward = self.ext_rewards.transpose(0, 1).reshape(-1, *self.ext_rewards.shape[2:])
         # for all tensors below, T x P -> P x T -> P * T
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1)
@@ -253,6 +274,8 @@ class BaseAlgo(ABC):
         exps.advantage = self.advantages.transpose(0, 1).reshape(-1)
         exps.returnn = exps.value + exps.advantage
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
+        exps.prev_action = self.prev_actions.transpose(0, 1).reshape(-1)
+        exps.prev_reward = self.prev_rewards.transpose(0, 1).reshape(-1)
 
         # Preprocess experiences
 
