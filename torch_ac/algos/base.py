@@ -9,7 +9,7 @@ class BaseAlgo(ABC):
 
     def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                 mem_type, ext_len, mem_len, n_layer, img_encode):
+                 mem_type, ext_len, mem_len, n_layer, img_encode, unity_env):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -54,7 +54,8 @@ class BaseAlgo(ABC):
 
         # Store parameters
 
-        self.env = ParallelEnv(envs, img_encode)
+        self.env = ParallelEnv(envs, img_encode,
+            unity_env=unity_env)
         self.acmodel = acmodel
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
