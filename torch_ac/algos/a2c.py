@@ -7,13 +7,13 @@ from torch_ac.algos.base import BaseAlgo
 class A2CAlgo(BaseAlgo):
     """The Advantage Actor-Critic algorithm."""
 
-    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
+    def __init__(self, eval_env, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, reshape_reward=None,
                  mem_type='lstm', ext_len=10, mem_len=10, n_layer=5, img_encode=False, unity_env=False):
         num_frames_per_proc = num_frames_per_proc or 8
 
-        super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
+        super().__init__(eval_env, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                          value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
                          mem_type, ext_len, mem_len, n_layer, img_encode, unity_env)
 

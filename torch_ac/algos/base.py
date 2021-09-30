@@ -2,12 +2,12 @@ from abc import ABC, abstractmethod
 import torch
 
 from torch_ac.format import default_preprocess_obss
-from torch_ac.utils import DictList, ParallelEnv
+from torch_ac.utils import DictList, ParallelEnv, get_agentview
 
 class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
-    def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
+    def __init__(self, eval_env, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
                  mem_type, ext_len, mem_len, n_layer, img_encode, unity_env):
         """
@@ -54,6 +54,7 @@ class BaseAlgo(ABC):
 
         # Store parameters
 
+        self.eval_env = eval_env
         self.env = ParallelEnv(envs, img_encode,
             unity_env=unity_env)
         self.acmodel = acmodel
@@ -72,6 +73,7 @@ class BaseAlgo(ABC):
         self.ext_len = ext_len
         self.mem_len = mem_len
         self.n_layer = n_layer
+        self.unity_env = unity_env
 
         # Control parameters
 
@@ -299,6 +301,73 @@ class BaseAlgo(ABC):
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
         return exps, logs
+
+    # test agent
+    def run_evaluation(self):
+
+        total_reward = 0
+        obs = self.eval_env.reset()
+        if self.unity_env:
+            img = get_agentview(obs[0], None, None, self.unity_env)
+            obs = {}
+            obs['image'] = img
+        else:
+            obs = self.eval_env.gen_obs()
+            obs['image'] = get_agentview(obs['image'], self.eval_env.agent_view_size, self.img_encode)
+        img_shape = obs['image'].shape
+        action = torch.zeros(1, device=self.device)
+        reward = torch.zeros(1, device=self.device)
+        done = False
+        if self.mem_type == 'lstm':
+            memory = torch.zeros(1, self.acmodel.memory_size, device=self.device)
+        else:
+            memory = torch.zeros(1, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
+            ext_img = torch.zeros(1, self.ext_len, *img_shape, device=self.device)
+            ext_act = torch.zeros(1, self.ext_len, device=self.device)
+            ext_reward = torch.zeros(1, self.ext_len, device=self.device)
+
+        while not done:
+            preprocessed_obs = self.preprocess_obss([obs], device=self.device)
+            with torch.no_grad():
+                if self.acmodel.recurrent:
+                    if self.mem_type == 'lstm':
+                        dist, value, memory, _ = self.acmodel(preprocessed_obs, memory, action, reward)
+                    elif 'trxl' in self.mem_type:  # transformers
+                        dist, value, memory, ext = self.acmodel(preprocessed_obs,
+                                memory.permute(1,2,0,3),
+                                action, reward,
+                                ext_img=ext_img, ext_act=ext_act, ext_reward=ext_reward)
+                    else:
+                        raise ValueError(f"The type must be one of lstm or trxls.")
+                else:
+                    dist, value, _, _ = self.acmodel(preprocessed_obs)
+            action = dist.probs.max(1)[1]
+
+            obs, reward, done, _ = self.eval_env.step(action.cpu().numpy())
+            if self.unity_env:
+                img = get_agentview(obs[0], None, None, self.unity_env)
+                obs = {}
+                obs['image'] = img
+            else:
+                obs = self.eval_env.gen_obs()
+                obs['image'] = get_agentview(obs['image'], self.eval_env.agent_view_size, self.img_encode)
+
+            if self.acmodel.recurrent:
+                if 'trxl' in self.mem_type:
+                    ext_img = ext['image']
+                    ext_act = ext['action']
+                    ext_reward = ext['reward']
+            if self.reshape_reward is not None:
+                reward = torch.tensor([
+                    self.reshape_reward(obs_, action_, reward_, done_)
+                    for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
+                ], device=self.device)
+            else:
+                reward = torch.tensor([reward], device=self.device)
+
+            total_reward += reward
+
+        return total_reward
 
     @abstractmethod
     def update_parameters(self):
