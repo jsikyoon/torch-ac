@@ -2,14 +2,14 @@ from abc import ABC, abstractmethod
 import torch
 
 from torch_ac.format import default_preprocess_obss
-from torch_ac.utils import DictList, ParallelEnv, get_agentview
+from torch_ac.utils import DictList, ParallelEnv
 
 class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
     def __init__(self, eval_env, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
-                 mem_type, ext_len, mem_len, n_layer, img_encode, unity_env):
+                 mem_type, ext_len, mem_len, n_layer):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -48,15 +48,12 @@ class BaseAlgo(ABC):
             the length of memory
         n_layer : int
             layers of memory module
-        img_encode : Boolean
-            Encoding image or compact map
         """
 
         # Store parameters
 
         self.eval_env = eval_env
-        self.env = ParallelEnv(envs, img_encode,
-            unity_env=unity_env)
+        self.env = ParallelEnv(envs)
         self.acmodel = acmodel
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
@@ -73,7 +70,6 @@ class BaseAlgo(ABC):
         self.ext_len = ext_len
         self.mem_len = mem_len
         self.n_layer = n_layer
-        self.unity_env = unity_env
 
         # Control parameters
 
@@ -116,7 +112,6 @@ class BaseAlgo(ABC):
         self.values = torch.zeros(*shape, device=self.device)
         self.rewards = torch.zeros(*shape, device=self.device)
         self.advantages = torch.zeros(*shape, device=self.device)
-        self.img_encode = img_encode
         self.log_probs = torch.zeros(*shape, device=self.device)
         self.prev_actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
         self.prev_rewards = torch.zeros(*shape, device=self.device)
@@ -307,13 +302,6 @@ class BaseAlgo(ABC):
 
         total_reward = 0
         obs = self.eval_env.reset()
-        if self.unity_env:
-            img = get_agentview(obs[0], None, None, self.unity_env)
-            obs = {}
-            obs['image'] = img
-        else:
-            obs = self.eval_env.gen_obs()
-            obs['image'] = get_agentview(obs['image'], self.eval_env.agent_view_size, self.img_encode)
         img_shape = obs['image'].shape
         action = torch.zeros(1, device=self.device)
         reward = torch.zeros(1, device=self.device)
@@ -344,13 +332,6 @@ class BaseAlgo(ABC):
             action = dist.probs.max(1)[1]
 
             obs, reward, done, _ = self.eval_env.step(action.cpu().numpy())
-            if self.unity_env:
-                img = get_agentview(obs[0], None, None, self.unity_env)
-                obs = {}
-                obs['image'] = img
-            else:
-                obs = self.eval_env.gen_obs()
-                obs['image'] = get_agentview(obs['image'], self.eval_env.agent_view_size, self.img_encode)
 
             if self.acmodel.recurrent:
                 if 'trxl' in self.mem_type:
