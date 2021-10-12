@@ -300,7 +300,7 @@ class BaseAlgo(ABC):
     # test agent
     def run_evaluation(self):
 
-        total_reward = 0
+        total_reward = 0.0
         obs = self.eval_env.reset()
         img_shape = obs['image'].shape
         action = torch.zeros(1, device=self.device)
@@ -344,7 +344,7 @@ class BaseAlgo(ABC):
                     for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
                 ], device=self.device)
             else:
-                reward = torch.tensor([reward], device=self.device)
+                reward = torch.tensor([reward], dtype=torch.float, device=self.device)
 
             total_reward += reward
 
