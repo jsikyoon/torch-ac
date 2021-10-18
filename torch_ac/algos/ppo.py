@@ -98,10 +98,14 @@ class PPOAlgo(BaseAlgo):
 
                     # Update memories for next epoch
 
-                    if self.acmodel.recurrent and i < self.recurrence - 1:
-                        exps.memory[inds + i + 1] = memory.detach()
-                        if 'trxl' in self.mem_type:
-                            exps.ext[inds + i + 1] = ext.detach()
+                    if 'trxl' in self.mem_type:
+                        for idx, _ind in enumerate(inds):
+                            if _ind == (exps.memory.shape[0]-1):
+                                continue
+                            exps.memory[_ind + i + 1] = memory[idx].detach()
+                    else:
+                        if self.acmodel.recurrent and i < self.recurrence - 1:
+                            exps.memory[inds + i + 1] = memory.detach()
 
                 # Update batch values
 
@@ -158,8 +162,9 @@ class PPOAlgo(BaseAlgo):
 
         # Shift starting indexes by self.recurrence//2 half the time
         if self.batch_num % 2 == 1:
-            indexes = indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]
-            indexes += self.recurrence // 2
+            if len(indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]) > 0:
+                indexes = indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]
+                indexes += self.recurrence // 2
         self.batch_num += 1
 
         num_indexes = self.batch_size // self.recurrence

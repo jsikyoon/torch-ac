@@ -7,11 +7,12 @@ from torch_ac.algos.base import BaseAlgo
 
 class VMPOAlgo(BaseAlgo):
 
-    def __init__(self, eval_env, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
+    def __init__(self, eval_env, envs, acmodel, acmodel_learner, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None, mem_type='lstm', ext_len=10, mem_len=10, n_layer=5):
-        num_frames_per_proc = num_frames_per_proc or 128
+                 reshape_reward=None, mem_type='lstm', ext_len=10, mem_len=10, n_layer=5,
+                 alpha=0.1, T_target=10):
+        num_frames_per_proc = num_frames_per_proc or 16
 
         super().__init__(eval_env, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                          value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
@@ -23,13 +24,16 @@ class VMPOAlgo(BaseAlgo):
         self.mem_type = mem_type
 
         self.eta = torch.autograd.Variable(torch.tensor(1.0), requires_grad=True)
-        self.alpha = torch.autograd.Variable(torch.tensor(0.1), requires_grad=True)
-        self.eps_eta = 0.02
-        self.eps_alpha = 0.1
+        self.alpha = torch.autograd.Variable(torch.tensor(alpha), requires_grad=True)
+        self._learner = acmodel_learner
+        self._t = 0
+        self._T = T_target
+        self.eps_eta = 0.1
+        self.eps_alpha = 0.004
 
         assert self.batch_size % self.recurrence == 0
 
-        self.params = list(self.acmodel.parameters()) + [self.eta, self.alpha]
+        self.params = list(self._learner.parameters()) + [self.eta, self.alpha]
         self.optimizer = torch.optim.Adam(self.params, lr, eps=adam_eps)
         self.batch_num = 0
 
@@ -45,16 +49,17 @@ class VMPOAlgo(BaseAlgo):
         for _ in range(self.epochs):
             # Initialize log values
 
-            log_entropies = []
+            log_log_probs = []
             log_values = []
             log_policy_losses = []
             log_value_losses = []
+            log_losses = []
             log_grad_norms = []
 
             for inds in self._get_batches_starting_indexes():
                 # Initialize batch values
 
-                batch_entropy = 0
+                batch_log_prob = 0
                 batch_value = 0
                 batch_policy_loss = 0
                 batch_value_loss = 0
@@ -74,16 +79,16 @@ class VMPOAlgo(BaseAlgo):
 
                     if self.acmodel.recurrent:
                         if self.mem_type == 'lstm':
-                            dist, value, memory, _ = self.acmodel(sb.obs, memory * sb.mask.unsqueeze(1),
+                            dist, value, memory, _ = self._learner(sb.obs, memory * sb.mask.unsqueeze(1),
                                 sb.prev_action*sb.mask, sb.prev_reward*sb.mask)
                         else: # transformers
-                            dist, value, memory, ext = self.acmodel(sb.obs,
+                            dist, value, memory, ext = self._learner(sb.obs,
                                 (memory*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).permute(1,2,0,3),
                                 sb.prev_action*sb.mask, sb.prev_reward*sb.mask,
                                 ext_img=sb.ext_img*sb.mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1),
                                 ext_act=sb.ext_act*sb.mask.unsqueeze(-1), ext_reward=sb.ext_reward*sb.mask.unsqueeze(-1))
                     else:
-                        dist, value, _, _ = self.acmodel(sb.obs)
+                        dist, value, _, _ = self._learner(sb.obs)
 
                     # Get samples with top half advantages
                     advprobs = torch.stack((sb.advantage, dist.log_prob(sb.action)))
@@ -100,29 +105,30 @@ class VMPOAlgo(BaseAlgo):
 
                     L_alpha = torch.mean(self.alpha*(self.eps_alpha-KL.detach())+self.alpha.detach()*KL)
 
-                    loss = L_pi + L_eta + L_alpha + 0.5*self.MseLoss(value, sb.returnn)
+                    policy_loss = (L_pi + L_eta + L_alpha).mean()
+                    #value_loss = 0.5*self.MseLoss(value, sb.returnn)
+                    value_loss = (value - sb.returnn).pow(2).mean()
+                    loss = policy_loss + value_loss
 
                     # Update batch values
 
-                    #batch_entropy += entropy.item()
+                    batch_log_prob += dist.log_prob(sb.action).mean().item()
                     batch_value += value.mean().item()
-                    #batch_policy_loss += policy_loss.item()
-                    #batch_value_loss += value_loss.item()
+                    batch_policy_loss += policy_loss.item()
+                    batch_value_loss += value_loss.item()
                     batch_loss += loss.mean()
 
                     # Update memories for next epoch
 
-                    if self.acmodel.recurrent and i < self.recurrence - 1:
+                    if self._learner.recurrent and i < self.recurrence - 1:
                         exps.memory[inds + i + 1] = memory.detach()
-                        if 'trxl' in self.mem_type:
-                            exps.ext[inds + i + 1] = ext.detach()
 
                 # Update batch values
 
-                #batch_entropy /= self.recurrence
+                batch_log_prob /= self.recurrence
                 batch_value /= self.recurrence
-                #batch_policy_loss /= self.recurrence
-                #batch_value_loss /= self.recurrence
+                batch_policy_loss /= self.recurrence
+                batch_value_loss /= self.recurrence
                 batch_loss /= self.recurrence
 
                 # Update actor-critic
@@ -130,7 +136,7 @@ class VMPOAlgo(BaseAlgo):
                 self.optimizer.zero_grad()
                 batch_loss.backward()
                 grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.params) ** 0.5
-                torch.nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)
+                #torch.nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)
                 self.optimizer.step()
                 with torch.no_grad():
                     self.eta.copy_(torch.clamp(self.eta, min=1e-8))
@@ -138,19 +144,28 @@ class VMPOAlgo(BaseAlgo):
 
                 # Update log values
 
-                log_entropies.append(batch_entropy)
+                log_log_probs.append(batch_log_prob)
                 log_values.append(batch_value)
                 log_policy_losses.append(batch_policy_loss)
                 log_value_losses.append(batch_value_loss)
+                log_losses.append(batch_loss.item())
                 log_grad_norms.append(grad_norm)
+
+        # Target update
+
+        self._t += 1
+        if self._t == self._T:
+            self.acmodel.load_state_dict(self._learner.state_dict())
+            self._t = 0
 
         # Log some values
 
         logs = {
-            "entropy": numpy.mean(log_entropies),
+            "log_prob": numpy.mean(log_log_probs),
             "value": numpy.mean(log_values),
             "policy_loss": numpy.mean(log_policy_losses),
             "value_loss": numpy.mean(log_value_losses),
+            "loss": numpy.mean(log_losses),
             "grad_norm": numpy.mean(log_grad_norms)
         }
 
@@ -175,8 +190,9 @@ class VMPOAlgo(BaseAlgo):
 
         # Shift starting indexes by self.recurrence//2 half the time
         if self.batch_num % 2 == 1:
-            indexes = indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]
-            indexes += self.recurrence // 2
+            if len(indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]) > 0:
+                indexes = indexes[(indexes + self.recurrence) % self.num_frames_per_proc != 0]
+                indexes += self.recurrence // 2
         self.batch_num += 1
 
         num_indexes = self.batch_size // self.recurrence

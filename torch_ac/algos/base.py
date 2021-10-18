@@ -7,7 +7,7 @@ from torch_ac.utils import DictList, ParallelEnv
 class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
-    def __init__(self, eval_env, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
+    def __init__(self, eval_envs, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward,
                  mem_type, ext_len, mem_len, n_layer):
         """
@@ -52,7 +52,8 @@ class BaseAlgo(ABC):
 
         # Store parameters
 
-        self.eval_env = eval_env
+        self.num_eval_procs = len(eval_envs)
+        self.eval_env = ParallelEnv(eval_envs)
         self.env = ParallelEnv(envs)
         self.acmodel = acmodel
         self.device = device
@@ -302,20 +303,22 @@ class BaseAlgo(ABC):
 
         total_reward = 0.0
         obs = self.eval_env.reset()
-        img_shape = obs['image'].shape
-        action = torch.zeros(1, device=self.device)
-        reward = torch.zeros(1, device=self.device)
-        done = False
+        img_shape = obs[0]['image'].shape
+        action = torch.zeros(self.num_eval_procs, device=self.device)
+        reward = torch.zeros(self.num_eval_procs, device=self.device)
+        total_reward = torch.zeros(self.num_eval_procs, device=self.device)
+        mask = torch.ones(self.num_eval_procs, device=self.device)
+        all_done = False
         if self.mem_type == 'lstm':
-            memory = torch.zeros(1, self.acmodel.memory_size, device=self.device)
+            memory = torch.zeros(self.num_eval_procs, self.acmodel.memory_size, device=self.device)
         else:
-            memory = torch.zeros(1, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
-            ext_img = torch.zeros(1, self.ext_len, *img_shape, device=self.device)
-            ext_act = torch.zeros(1, self.ext_len, device=self.device)
-            ext_reward = torch.zeros(1, self.ext_len, device=self.device)
+            memory = torch.zeros(self.num_eval_procs, self.n_layer+1, self.mem_len, self.acmodel.semi_memory_size, device=self.device)
+            ext_img = torch.zeros(self.num_eval_procs, self.ext_len, *img_shape, device=self.device)
+            ext_act = torch.zeros(self.num_eval_procs, self.ext_len, device=self.device)
+            ext_reward = torch.zeros(self.num_eval_procs, self.ext_len, device=self.device)
 
-        while not done:
-            preprocessed_obs = self.preprocess_obss([obs], device=self.device)
+        while not all_done:
+            preprocessed_obs = self.preprocess_obss(obs, device=self.device)
             with torch.no_grad():
                 if self.acmodel.recurrent:
                     if self.mem_type == 'lstm':
@@ -344,11 +347,18 @@ class BaseAlgo(ABC):
                     for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
                 ], device=self.device)
             else:
-                reward = torch.tensor([reward], dtype=torch.float, device=self.device)
+                reward = torch.tensor(reward, dtype=torch.float, device=self.device)
 
-            total_reward += reward
+            total_reward += reward * mask
 
-        return total_reward
+            for idx, _d in enumerate(done):
+                if _d:
+                    mask[idx] = 0
+
+            if mask.sum().item() == 0:
+                all_done=True
+
+        return total_reward.mean()
 
     @abstractmethod
     def update_parameters(self):
