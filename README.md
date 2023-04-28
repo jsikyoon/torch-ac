@@ -1,5 +1,7 @@
 # PyTorch Actor-Critic deep reinforcement learning algorithms: A2C and PPO
 
+This is a backup of Jaesik's master
+
 The `torch_ac` package contains the PyTorch implementation of two Actor-Critic deep reinforcement learning algorithms:
 
 - [Synchronous A3C (A2C)](https://arxiv.org/pdf/1602.01783.pdf)
